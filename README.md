@@ -2,12 +2,11 @@
 
 DONE:
 1. simulation for count-FM (binomial bridge)
+2. comparison models
+3. conditional generation (classifier-free guidance, CFG)
+4. path for count-FM vs. Dirichlet FM
 
 TODO:
 
-- Experiements:
-  1. comparison models:
-  2. real data
-
-- Theom:
-  1. show Poisson deviance corresponds to ELBO.
+1. The path for others
+2. applications
