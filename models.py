@@ -1,3 +1,4 @@
+import math
 import numpy as np
 import torch
 import torch.nn as nn
@@ -105,6 +106,183 @@ class MLP_rate(nn.Module):
         log_rate = torch.clamp(self.base(x), max=self.log_cap)  # cap huge logits
         return torch.exp(log_rate) + self.eps   
 
+
+#### -------------------------------------------------------------------
+#### transformer used in DFM for scRNA
+
+def _timestep_embedding(t, dim, max_period=10000):
+    if t.ndim == 2:
+        t = t[:, 0]
+    half = dim // 2
+    device = t.device
+    dtype = t.dtype
+    freqs = torch.exp(
+        -math.log(max_period) * torch.arange(0, half, device=device, dtype=dtype) / max(half, 1)
+    )
+    args = t[:, None] * freqs[None, :] * 2.0 * math.pi
+    emb = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+    if dim % 2 == 1:
+        emb = F.pad(emb, (0, 1))
+    return emb
+
+
+def _modulate(x, shift, scale):
+    return x * (1.0 + scale[:, None, :]) + shift[:, None, :]
+
+
+class AdaLNTransformerBlock(nn.Module):
+    def __init__(self, d_model=256, n_heads=8, mlp_ratio=4.0, dropout=0.0):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(d_model, elementwise_affine=False)
+        self.attn = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=n_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.norm2 = nn.LayerNorm(d_model, elementwise_affine=False)
+
+        d_ff = int(d_model * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, d_ff),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_ff, d_model),
+            nn.Dropout(dropout),
+        )
+        
+        self.adaLN = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(d_model, 6 * d_model),
+        )
+
+    def forward(self, x, cond):
+        s1, sc1, g1, s2, sc2, g2 = self.adaLN(cond).chunk(6, dim=-1)
+
+        h = _modulate(self.norm1(x), s1, sc1)
+        attn_out, _ = self.attn(h, h, h, need_weights=False)
+        x = x + g1[:, None, :] * attn_out
+
+        h = _modulate(self.norm2(x), s2, sc2)
+        mlp_out = self.mlp(h)
+        x = x + g2[:, None, :] * mlp_out
+        return x
+
+
+class ChunkedAdaLNTransformer(nn.Module):
+    def __init__(
+        self,
+        dim,
+        out_dim=None,
+        time_varying=True,
+        d_model=256,
+        depth=8,
+        n_heads=8,
+        mlp_ratio=4.0,
+        dropout=0.0,
+        chunk_size=128,
+        max_period=10000,
+    ):
+        super().__init__()
+        self.dim = dim
+        self.out_dim = out_dim if out_dim is not None else dim
+        self.time_varying = time_varying
+        self.d_model = d_model
+        self.depth = depth
+        self.n_heads = n_heads
+        self.chunk_size = chunk_size
+        self.max_period = max_period
+
+        if self.out_dim % self.dim != 0:
+            raise ValueError(
+                f"ChunkedAdaLNTransformer currently expects out_dim to be a multiple of dim. "
+                f"Got dim={self.dim}, out_dim={self.out_dim}."
+            )
+        self.out_mult = self.out_dim // self.dim
+
+        self.n_tokens = (self.dim + self.chunk_size - 1) // self.chunk_size
+        self.padded_dim = self.n_tokens * self.chunk_size
+
+        self.token_in = nn.Linear(self.chunk_size, d_model)
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.n_tokens, d_model))
+
+        if self.time_varying:
+            self.time_mlp = nn.Sequential(
+                nn.Linear(d_model, d_model),
+                nn.SiLU(),
+                nn.Linear(d_model, d_model),
+            )
+        else:
+            self.time_mlp = None
+
+        self.blocks = nn.ModuleList([
+            AdaLNTransformerBlock(
+                d_model=d_model,
+                n_heads=n_heads,
+                mlp_ratio=mlp_ratio,
+                dropout=dropout,
+            )
+            for _ in range(depth)
+        ])
+
+        self.final_norm = nn.LayerNorm(d_model, elementwise_affine=False)
+        self.final_adaLN = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(d_model, 2 * d_model),
+        )
+
+        self.token_out = nn.Linear(d_model, self.chunk_size * self.out_mult)
+        nn.init.normal_(self.pos_embed, std=0.02)
+
+    def _get_cond(self, t):
+        if not self.time_varying:
+            return torch.zeros((t.shape[0], self.d_model), device=t.device, dtype=t.dtype)
+        temb = _timestep_embedding(t, self.d_model, max_period=self.max_period)
+        return self.time_mlp(temb)
+
+    def forward(self, z):
+        if self.time_varying:
+            x = z[:, :self.dim]
+            t = z[:, self.dim:]
+        else:
+            x = z
+            t = torch.zeros((x.shape[0], 1), device=x.device, dtype=x.dtype)
+
+        B = x.shape[0]
+
+        if self.padded_dim > self.dim:
+            x = F.pad(x, (0, self.padded_dim - self.dim))
+        x = x.view(B, self.n_tokens, self.chunk_size)
+
+        h = self.token_in(x) + self.pos_embed
+        cond = self._get_cond(t)
+        
+        for blk in self.blocks:
+            h = blk(h, cond)
+
+        s, sc = self.final_adaLN(cond).chunk(2, dim=-1)
+        h = _modulate(self.final_norm(h), s, sc)
+        y = self.token_out(h)
+        
+        y = y.view(B, self.n_tokens, self.out_mult, self.chunk_size)
+        y = y.permute(0, 2, 1, 3).contiguous()
+
+        y = y.view(B, self.out_mult, self.padded_dim)
+        y = y[:, :, :self.dim]
+        y = y.reshape(B, self.out_dim)
+        return y
+
+
+class ChunkedAdaLNTransformer_rate(nn.Module):
+    def __init__(self, base_model, log_cap=12.0, eps=1e-8):
+        super().__init__()
+        self.base = base_model
+        self.log_cap = log_cap
+        self.eps = eps
+
+    def forward(self, x):
+        log_rate = torch.clamp(self.base(x), max=self.log_cap)
+        return torch.exp(log_rate) + self.eps
 
 
 ####--------------------------------------------------------------------

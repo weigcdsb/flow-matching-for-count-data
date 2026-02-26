@@ -3,6 +3,7 @@ import torch
 from tqdm import tqdm
 import torch.nn as nn
 import torch.nn.functional as F
+import ot
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 torch.set_default_device(device)
@@ -62,6 +63,147 @@ def model_loss(loss_mode, rates_theta, rates_star, eps_log = 1e-8):
     
     return loss
 
+def _get_ot_cost_matrix(x0, x1, ot_cost="none", ot_eps=1e-8):
+    key = ot_cost.lower()
+
+    if key == "none":
+        return None
+    if key == "l1":
+        return (x0[:, None, :] - x1[None, :, :]).abs().sum(dim=2)
+    if key == "l2":
+        return torch.cdist(x0, x1, p=2) ** 2
+    if key in {"sym_poisson", "symmetric_poisson", "symmetric-poisson", "poisson"}:
+        A = x0[:, None, :].float()
+        B = x1[None, :, :].float()
+        d_ab = A * torch.log((A + ot_eps) / (B + ot_eps)) - A + B
+        d_ba = B * torch.log((B + ot_eps) / (A + ot_eps)) - B + A
+        return (d_ab + d_ba).sum(dim=2)
+
+    raise ValueError(f"Unknown ot_cost: {ot_cost}")
+
+
+def _soft_ot_pair_batch(x0, x1, ot_cost="none", ot_eps=1e-8):
+    key = ot_cost.lower()
+    if key == "none":
+        return x0, x1
+
+    B0 = x0.shape[0]
+    B1 = x1.shape[0]
+
+    M = _get_ot_cost_matrix(x0, x1, ot_cost=ot_cost, ot_eps=ot_eps)
+    a = ot.unif(B0)
+    b = ot.unif(B1)
+    pi = ot.emd(a, b, M.detach().cpu().numpy())
+
+    pi = np.asarray(pi, dtype=np.float64)
+    if (not np.all(np.isfinite(pi))) or (pi.sum() <= 1e-12):
+        p = np.ones(B0 * B1, dtype=np.float64) / float(B0 * B1)
+    else:
+        p = np.clip(pi, 0.0, None).reshape(-1)
+        p = p / p.sum()
+
+    choice = np.random.choice(B0 * B1, size=B1, replace=True, p=p)
+    i_np, j_np = np.divmod(choice, B1)
+
+    i = torch.as_tensor(i_np, device=x0.device, dtype=torch.long)
+    j = torch.as_tensor(j_np, device=x1.device, dtype=torch.long)
+
+    return x0[i], x1[j]
+
+
+# def CountFM_train(
+#     X1_torch,
+#     nets,
+#     optimizer,
+#     num_epochs,
+#     batch_size,
+#     device,
+#     separate_heads=False,
+#     X0_torch=None,
+#     x0_mode="uniform",  # "uniform", "poisson", or "dataset"
+#     C_max=None,
+#     margin=2,
+#     eps_t=1e-4,
+#     eps_log=1e-8,
+#     loss_mode="poisson",
+# ):
+#     X1_torch = X1_torch.to(device)
+#     N1, d = X1_torch.shape
+
+#     if X0_torch is not None:
+#         X0_torch = X0_torch.to(device)
+#         N0 = X0_torch.shape[0]
+#     else:
+#         N0 = N1
+
+#     if C_max is None:
+#         C_max = int(X1_torch.max().item() + margin)
+
+#     steps_per_epoch = (max(N0, N1) + batch_size - 1) // batch_size
+
+#     for epoch in tqdm(range(num_epochs)):
+#         perm1 = torch.randperm(N1, device=device)
+#         if X0_torch is not None and x0_mode == "dataset":
+#             perm0 = torch.randperm(N0, device=device)
+#         else:
+#             perm0 = None
+
+#         for step in range(steps_per_epoch):
+#             start = step * batch_size
+#             base  = torch.arange(batch_size, device=device)
+
+#             # sample x1 from data (like DFM)
+#             idx1 = perm1[(start + base) % N1]
+#             x1   = X1_torch[idx1]   # [B,d]
+#             B    = x1.shape[0]
+
+#             # construct x0 depending on mode
+#             if X0_torch is not None and x0_mode == "dataset":
+#                 idx0 = perm0[(start + base) % N0]
+#                 x0   = X0_torch[idx0]
+#             elif x0_mode == "uniform":
+#                 # uniform prior over counts 0..C_max (D-FM-analogous)
+#                 x0 = torch.randint(
+#                     low=0,
+#                     high=C_max + 1,
+#                     size=x1.shape,
+#                     device=device,
+#                     dtype=x1.dtype,
+#                 )
+#             elif x0_mode == "poisson":
+#                 lam0 = 1.0
+#                 x0 = torch.poisson(
+#                     torch.full_like(x1, lam0, dtype=torch.float32)
+#                 ).to(x1.dtype)
+#             else:
+#                 raise ValueError(f"Unknown x0_mode: {x0_mode}")
+
+#             # 2. sample time U[eps_t, 1-eps_t]
+#             t = torch.rand(B, 1, device=device) * (1.0 - 2.0 * eps_t) + eps_t
+
+#             # 3. Binomial bridge
+#             xt = sample_xt(x0, x1, t)
+
+#             # 4. conditional rates
+#             rates_star, idx_0 = sample_rt(xt, x1, t, eps_t)
+
+#             # 5. model forward
+#             xt_t = torch.cat([xt, t], dim=1)   # [B, d+1]
+#             rates_theta = model_forward(xt_t, separate_heads, nets, d, idx_0)
+
+#             # 6. loss
+#             loss = model_loss(loss_mode, rates_theta, rates_star, eps_log)
+
+#             # 7. backprop
+#             optimizer.zero_grad(set_to_none=True)
+#             loss.backward()
+#             optimizer.step()
+
+#         if epoch % max(1, (num_epochs // 5)) == 0:
+#             print(f"[CountFM][epoch {epoch}] loss={float(loss):.6f}")
+
+#     return nets, loss
+
 def CountFM_train(
     X1_torch,
     nets,
@@ -72,6 +214,7 @@ def CountFM_train(
     separate_heads=False,
     X0_torch=None,
     x0_mode="uniform",  # "uniform", "poisson", or "dataset"
+    ot_cost="none",     # "none", "L1", "L2", "sym_poisson"
     C_max=None,
     margin=2,
     eps_t=1e-4,
@@ -103,17 +246,14 @@ def CountFM_train(
             start = step * batch_size
             base  = torch.arange(batch_size, device=device)
 
-            # sample x1 from data (like DFM)
             idx1 = perm1[(start + base) % N1]
-            x1   = X1_torch[idx1]   # [B,d]
+            x1   = X1_torch[idx1]
             B    = x1.shape[0]
 
-            # construct x0 depending on mode
             if X0_torch is not None and x0_mode == "dataset":
                 idx0 = perm0[(start + base) % N0]
                 x0   = X0_torch[idx0]
             elif x0_mode == "uniform":
-                # uniform prior over counts 0..C_max (D-FM-analogous)
                 x0 = torch.randint(
                     low=0,
                     high=C_max + 1,
@@ -129,23 +269,20 @@ def CountFM_train(
             else:
                 raise ValueError(f"Unknown x0_mode: {x0_mode}")
 
-            # 2. sample time U[eps_t, 1-eps_t]
+            x0, x1 = _soft_ot_pair_batch(
+                x0, x1,
+                ot_cost=ot_cost,
+                ot_eps=eps_log,
+            )
+            B = x1.shape[0]
+
             t = torch.rand(B, 1, device=device) * (1.0 - 2.0 * eps_t) + eps_t
-
-            # 3. Binomial bridge
             xt = sample_xt(x0, x1, t)
-
-            # 4. conditional rates
             rates_star, idx_0 = sample_rt(xt, x1, t, eps_t)
-
-            # 5. model forward
-            xt_t = torch.cat([xt, t], dim=1)   # [B, d+1]
+            xt_t = torch.cat([xt, t], dim=1)
             rates_theta = model_forward(xt_t, separate_heads, nets, d, idx_0)
-
-            # 6. loss
             loss = model_loss(loss_mode, rates_theta, rates_star, eps_log)
 
-            # 7. backprop
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
@@ -154,6 +291,7 @@ def CountFM_train(
             print(f"[CountFM][epoch {epoch}] loss={float(loss):.6f}")
 
     return nets, loss
+
 
 #### genearation
 
